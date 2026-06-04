@@ -154,6 +154,7 @@ Set via environment variables (or a `.env` file — Bun reads it automatically):
 | `FERAL_BUDGET_CONVERSATION` | `50000` | per-conversation token cap |
 | `FERAL_BUDGET_DAY` | `500000` | per-day token cap |
 | `FERAL_BUDGET_POLICY` | `compress_and_continue` | or `stop` |
+| `FERAL_FETCH_DOMAINS` | — | comma-separated domain allowlist for `fetch_url` (e.g. `example.com,api.github.com`) |
 | `FERAL_INNER_THOUGHTS_ENABLED` | `false` | `true` to enable proactive loop (V2) |
 | `FERAL_THOUGHTS_INTERVAL_MS` | `300000` | inner-thoughts tick interval |
 

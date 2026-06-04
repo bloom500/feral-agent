@@ -16,9 +16,13 @@ import { InferenceRouter } from "./sandbox/inference-router.ts";
 import { EpisodicMemory } from "./memory/episodic.ts";
 import { SemanticMemory } from "./memory/semantic.ts";
 import { RecallEngine } from "./memory/recall.ts";
+import { MemoryExtractor } from "./memory/extractor.ts";
 import { ToolRegistry } from "./tools/registry.ts";
 import { createReadFileTool } from "./tools/builtin/read-file.ts";
+import { createWriteFileTool } from "./tools/builtin/write-file.ts";
+import { createListDirectoryTool } from "./tools/builtin/list-directory.ts";
 import { createWebSearchTool } from "./tools/builtin/web-search.ts";
+import { createFetchUrlTool } from "./tools/builtin/fetch-url.ts";
 import { AgentLoop } from "./core/agent-loop.ts";
 import { MoodEngine } from "./core/mood.ts";
 import { InnerThoughtsLoop } from "./core/inner-thoughts.ts";
@@ -105,16 +109,28 @@ function main(): void {
   // --- Tools (each gated by the sandbox) ---
   const registry = new ToolRegistry(egress, audit);
   registry.register(createReadFileTool([config.workspace]));
+  registry.register(createWriteFileTool([config.workspace]));
+  registry.register(createListDirectoryTool([config.workspace]));
   registry.register(createWebSearchTool());
+  // fetch_url: extend FERAL_FETCH_DOMAINS env (comma-separated) to whitelist domains
+  const fetchDomains = (process.env.FERAL_FETCH_DOMAINS ?? "")
+    .split(",").map((d) => d.trim()).filter(Boolean);
+  if (fetchDomains.length > 0) {
+    registry.register(createFetchUrlTool(fetchDomains));
+  }
 
   // --- Mood engine ---
   const mood = new MoodEngine();
+
+  // --- Memory extractor (async, fire-and-forget after each turn) ---
+  const extractor = new MemoryExtractor(router, semantic);
 
   // --- Layer 1: Agent core ---
   const agent = new AgentLoop(
     router, registry, episodic,
     { onBudgetExhausted: config.inference.tokenBudget.onExhausted },
     recall,
+    extractor,
   );
 
   // --- Inner thoughts loop (proactive background) ---

@@ -21,6 +21,7 @@ import {
 import type { ToolRegistry } from "../tools/registry.ts";
 import type { EpisodicMemory } from "../memory/episodic.ts";
 import type { RecallEngine } from "../memory/recall.ts";
+import type { MemoryExtractor } from "../memory/extractor.ts";
 import { WorkingMemory } from "../memory/working.ts";
 import type {
   ChatMessage,
@@ -52,6 +53,7 @@ export class AgentLoop {
   readonly #registry: ToolRegistry;
   readonly #episodic: EpisodicMemory;
   readonly #recall: RecallEngine | null;
+  readonly #extractor: MemoryExtractor | null;
   readonly #config: AgentLoopConfig;
   readonly #systemPrompt: string;
   /** One working-memory transcript per session, retained across messages. */
@@ -63,11 +65,13 @@ export class AgentLoop {
     episodic: EpisodicMemory,
     config: Partial<AgentLoopConfig> = {},
     recall: RecallEngine | null = null,
+    extractor: MemoryExtractor | null = null,
   ) {
     this.#router = router;
     this.#registry = registry;
     this.#episodic = episodic;
     this.#recall = recall;
+    this.#extractor = extractor;
     this.#config = { ...DEFAULT_CONFIG, ...config };
     this.#systemPrompt = buildSystemPrompt(registry);
   }
@@ -99,6 +103,10 @@ export class AgentLoop {
       memory.addAssistant(final);
       this.#episodic.record(sessionId, "assistant", final);
       emit({ type: "done", id: messageId, content: final });
+
+      // Fire-and-forget: extract durable user facts from the turn just completed.
+      this.#extractor?.extractAsync(sessionId, [...memory.turns]);
+
       return final;
     } catch (err) {
       const message = errorMessage(err);
@@ -114,15 +122,22 @@ export class AgentLoop {
     emit: EventSink,
   ): Promise<string> {
     for (let i = 0; i < this.#config.maxIterations; i++) {
-      const completion = await this.#complete(sessionId, memory);
+      // Stream tokens live. We optimistically stream every completion; if the
+      // model ends up emitting a tool call the accumulated tokens are discarded
+      // from the UI perspective (the tool events replace them), but the model
+      // rarely mixes prose + tool call in one turn in practice.
+      let streamedSoFar = "";
+      const onToken = (token: string) => {
+        streamedSoFar += token;
+        emit({ type: "chunk", id: messageId, content: token });
+      };
+
+      const completion = await this.#complete(sessionId, memory, onToken);
       const parsed = parseResponse(completion);
 
       if (parsed.toolCalls.length === 0) {
-        // No tool calls → this is the final answer.
-        if (parsed.text.trim()) {
-          emit({ type: "chunk", id: messageId, content: parsed.text });
-        }
-        return parsed.text.trim() || "(no response)";
+        // No tool calls → this is the final answer. Tokens already streamed.
+        return parsed.text.trim() || streamedSoFar.trim() || "(no response)";
       }
 
       // Record the assistant's tool-calling turn so the model sees its own
@@ -153,12 +168,14 @@ export class AgentLoop {
   async #complete(
     sessionId: string,
     memory: WorkingMemory,
+    onToken?: (token: string) => void,
   ): Promise<string> {
     try {
       const res = await this.#router.complete({
         sessionId,
         messages: memory.render(),
         maxTokens: this.#config.maxTokensPerCall,
+        onToken,
       });
       return res.content;
     } catch (err) {
@@ -174,6 +191,7 @@ export class AgentLoop {
             sessionId,
             messages: memory.render(),
             maxTokens: this.#config.maxTokensPerCall,
+            onToken,
           });
           return res.content;
         }
@@ -219,77 +237,130 @@ export class AgentLoop {
 // ---------------------------------------------------------------------------
 
 function buildSystemPrompt(registry: ToolRegistry): string {
+  const tools = registry.describe();
   return [
-    "You are Feral, a proactive, helpful local AI agent.",
-    "You run inside a security sandbox; you can only act through declared tools.",
+    "You are Feral, a proactive and helpful AI assistant running locally on the user's device.",
+    "You have access to tools and use them when they help answer a question.",
+    "You never invent tool results — always call the tool and wait for the real output.",
     "",
-    "Available tools:",
-    registry.describe() || "(none)",
+    tools ? `## Available tools\n${tools}` : "No tools are available.",
     "",
-    "To call a tool, output a fenced code block tagged `tool` containing a JSON",
-    'object: {"name": "<tool>", "args": { ... }}. You may emit several such',
-    "blocks to call multiple tools. Example:",
+    "## How to call a tool",
+    "Emit a fenced code block with the tag `tool`, containing a single JSON object:",
     "```tool",
-    '{"name": "web_search", "args": {"query": "weather in Tokyo"}}',
+    '{"name": "tool_name", "args": {"param": "value"}}',
     "```",
+    "You may call multiple tools in sequence across turns.",
+    "After each tool result is returned, continue reasoning and either call another",
+    "tool or write your final answer as plain text with no tool block.",
     "",
-    "After tool results are returned to you, continue reasoning. When you have",
-    "the final answer, reply in plain text with no tool block.",
+    "## Rules",
+    "- Be concise and direct.",
+    "- If you cannot help or a tool fails, say so clearly.",
+    "- Never output raw JSON outside a tool block as your final answer.",
+    "- Respond in the same language the user writes in.",
   ].join("\n");
 }
 
 /**
- * Parse a model response into free text plus any tool calls. Tool calls are
- * fenced ```tool / ```json blocks holding a {name, args} object; a bare JSON
- * object that is itself a tool call is also accepted. Malformed blocks are
- * ignored rather than treated as calls.
+ * Parse a model response into free text plus any tool calls.
+ *
+ * Accepted formats (tried in order):
+ *   1. Fenced block tagged `tool` or `json` — the canonical format
+ *   2. Any fenced block containing a valid tool-call JSON object
+ *   3. A bare JSON object on its own line containing `name`/`args`
+ *   4. A bare JSON object that is the entire response
+ *
+ * Malformed blocks are silently ignored; partial / extra text around a tool
+ * call is preserved as the text portion.
  */
 export function parseResponse(raw: string): ParsedResponse {
   const toolCalls: ParsedToolCall[] = [];
-  const fence = /```(?:tool|json)?\s*([\s\S]*?)```/g;
   let text = raw;
-  let match: RegExpExecArray | null;
 
+  // Pass 1: fenced blocks (```tool, ```json, or unlabelled)
+  const fence = /```(?:tool|json|[a-z]*)?\s*([\s\S]*?)```/g;
+  let match: RegExpExecArray | null;
   while ((match = fence.exec(raw)) !== null) {
     const call = tryParseCall(match[1] ?? "");
     if (call) {
       toolCalls.push(call);
-      text = text.replace(match[0], "");
+      text = text.replace(match[0], "").trim();
     }
   }
 
-  if (toolCalls.length === 0) {
-    // Allow a bare JSON tool call with no fences.
-    const bare = tryParseCall(raw);
-    if (bare) {
-      return { text: "", toolCalls: [bare] };
+  if (toolCalls.length > 0) return { text: text.trim(), toolCalls };
+
+  // Pass 2: bare JSON object on its own line (models sometimes skip fences)
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) continue;
+    const call = tryParseCall(trimmed);
+    if (call) {
+      toolCalls.push(call);
+      text = text.replace(line, "").trim();
     }
   }
 
-  return { text: text.trim(), toolCalls };
+  if (toolCalls.length > 0) return { text: text.trim(), toolCalls };
+
+  // Pass 3: entire response is a bare JSON tool call
+  const bare = tryParseCall(raw.trim());
+  if (bare) return { text: "", toolCalls: [bare] };
+
+  return { text: raw.trim(), toolCalls: [] };
 }
 
 function tryParseCall(candidate: string): ParsedToolCall | null {
   const trimmed = candidate.trim();
   if (!trimmed.startsWith("{")) return null;
+
+  // Find the first complete JSON object (handles trailing text after the object)
   let obj: unknown;
   try {
     obj = JSON.parse(trimmed);
   } catch {
-    return null;
+    // Try to extract just the first JSON object if there's trailing text
+    const end = findJsonEnd(trimmed);
+    if (end < 0) return null;
+    try {
+      obj = JSON.parse(trimmed.slice(0, end + 1));
+    } catch {
+      return null;
+    }
   }
-  if (typeof obj !== "object" || obj === null) return null;
+
+  if (typeof obj !== "object" || obj === null || Array.isArray(obj)) return null;
 
   const record = obj as Record<string, unknown>;
+  // Support {"name":..,"args":..}, {"tool":..,"args":..}, {"tool":..,"parameters":..}
   const name = record.name ?? record.tool;
-  if (typeof name !== "string" || !name) return null;
+  if (typeof name !== "string" || !name.trim()) return null;
 
+  const rawArgs = record.args ?? record.parameters ?? record.input ?? {};
   const args =
-    typeof record.args === "object" && record.args !== null
-      ? (record.args as Record<string, unknown>)
+    typeof rawArgs === "object" && rawArgs !== null && !Array.isArray(rawArgs)
+      ? (rawArgs as Record<string, unknown>)
       : {};
 
-  return { name, args };
+  return { name: name.trim(), args };
+}
+
+/** Find the index of the closing brace of the first top-level JSON object. */
+function findJsonEnd(s: string): number {
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (escape) { escape = false; continue; }
+    if (c === "\\") { escape = true; continue; }
+    if (c === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (c === "{") depth++;
+    else if (c === "}") { depth--; if (depth === 0) return i; }
+  }
+  return -1;
 }
 
 function errorMessage(err: unknown): string {

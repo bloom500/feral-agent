@@ -163,6 +163,12 @@ export interface InferenceRequest {
   /** Soft cap for this single completion. */
   maxTokens?: number;
   temperature?: number;
+  /**
+   * When provided, the router streams tokens from the provider and calls this
+   * callback for each partial token as it arrives. The full assembled content
+   * is still returned in InferenceResponse at the end.
+   */
+  onToken?: (token: string) => void;
 }
 
 export interface InferenceResponse {

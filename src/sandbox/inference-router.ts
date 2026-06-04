@@ -221,6 +221,11 @@ export class InferenceRouter {
     isFallback: boolean,
   ): Promise<InferenceResponse> {
     const url = `${trimSlash(target.baseUrl)}/api/chat`;
+
+    if (req.onToken) {
+      return this.#streamOllama(url, target, req, isFallback);
+    }
+
     const body = {
       model: target.model,
       messages: req.messages.map(toProviderMessage),
@@ -250,12 +255,116 @@ export class InferenceRouter {
     };
   }
 
+  async #streamOllama(
+    url: string,
+    target: ModelTarget,
+    req: InferenceRequest,
+    isFallback: boolean,
+  ): Promise<InferenceResponse> {
+    const body = {
+      model: target.model,
+      messages: req.messages.map(toProviderMessage),
+      stream: true,
+      options: {
+        temperature: req.temperature ?? 0.7,
+        ...(req.maxTokens ? { num_predict: req.maxTokens } : {}),
+      },
+    };
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 120_000);
+
+    let content = "";
+    let promptTokens = 0;
+    let completionTokens = 0;
+
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const detail = await res.text().catch(() => "");
+        throw new InferenceError(
+          `inference endpoint ${url} returned ${res.status}: ${detail.slice(0, 200)}`,
+        );
+      }
+      if (!res.body) throw new InferenceError("no response body for streaming");
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+
+      const processLine = (line: string): void => {
+        const trimmed = line.trim();
+        if (!trimmed) return;
+        let chunk: unknown;
+        try { chunk = JSON.parse(trimmed); } catch { return; }
+
+        const token =
+          (chunk as { message?: { content?: string } }).message?.content ?? "";
+        if (token) {
+          content += token;
+          req.onToken!(token);
+        }
+
+        const isDone = (chunk as { done?: boolean }).done === true;
+        if (isDone) {
+          promptTokens =
+            (chunk as { prompt_eval_count?: number }).prompt_eval_count ??
+            estimateTokens(req.messages);
+          completionTokens =
+            (chunk as { eval_count?: number }).eval_count ??
+            estimateText(content);
+        }
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+
+        // Ollama streams one JSON object per line. Keep the last incomplete
+        // line in the buffer in case it spans a chunk boundary.
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
+        for (const line of lines) processLine(line);
+      }
+
+      // Flush any remaining content (e.g. a complete response without a
+      // trailing newline, which is the case for non-streaming mock responses).
+      if (buf.trim()) processLine(buf);
+      buf = "";
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (!promptTokens) promptTokens = estimateTokens(req.messages);
+    if (!completionTokens) completionTokens = estimateText(content);
+
+    return {
+      content,
+      promptTokens,
+      completionTokens,
+      totalTokens: promptTokens + completionTokens,
+      model: target.model,
+      usedFallback: isFallback,
+    };
+  }
+
   async #callOpenAICompatible(
     target: ModelTarget,
     req: InferenceRequest,
     isFallback: boolean,
   ): Promise<InferenceResponse> {
     const url = `${trimSlash(target.baseUrl)}/v1/chat/completions`;
+
+    if (req.onToken) {
+      return this.#streamOpenAI(url, target, req, isFallback);
+    }
+
     const body = {
       model: target.model,
       messages: req.messages.map(toProviderMessage),
@@ -279,6 +388,87 @@ export class InferenceRouter {
       promptTokens,
       completionTokens,
       totalTokens: promptTokens + completionTokens,
+      model: target.model,
+      usedFallback: isFallback,
+    };
+  }
+
+  async #streamOpenAI(
+    url: string,
+    target: ModelTarget,
+    req: InferenceRequest,
+    isFallback: boolean,
+  ): Promise<InferenceResponse> {
+    const body = {
+      model: target.model,
+      messages: req.messages.map(toProviderMessage),
+      temperature: req.temperature ?? 0.7,
+      ...(req.maxTokens ? { max_tokens: req.maxTokens } : {}),
+      stream: true,
+    };
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 120_000);
+
+    let content = "";
+
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const detail = await res.text().catch(() => "");
+        throw new InferenceError(
+          `inference endpoint ${url} returned ${res.status}: ${detail.slice(0, 200)}`,
+        );
+      }
+      if (!res.body) throw new InferenceError("no response body for streaming");
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+
+      const processSSELine = (line: string): void => {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) return;
+        const data = trimmed.slice(5).trim();
+        if (data === "[DONE]") return;
+        let chunk: unknown;
+        try { chunk = JSON.parse(data); } catch { return; }
+
+        const token =
+          (chunk as { choices?: { delta?: { content?: string } }[] })
+            .choices?.[0]?.delta?.content ?? "";
+        if (token) {
+          content += token;
+          req.onToken!(token);
+        }
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+
+        // SSE format: "data: {...}\n\n"
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
+        for (const line of lines) processSSELine(line);
+      }
+
+      if (buf.trim()) processSSELine(buf);
+    } finally {
+      clearTimeout(timer);
+    }
+
+    return {
+      content,
+      promptTokens: estimateTokens(req.messages),
+      completionTokens: estimateText(content),
+      totalTokens: estimateTokens(req.messages) + estimateText(content),
       model: target.model,
       usedFallback: isFallback,
     };
