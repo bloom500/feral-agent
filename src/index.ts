@@ -157,6 +157,30 @@ function main(): void {
         process.exit(0);
         break;
 
+      case "set_model": {
+        const provider = msg.provider;
+        const model = msg.model;
+        const baseUrl = msg.baseUrl;
+        if (!provider || !model || !baseUrl) {
+          transport.send({
+            type: "model_error",
+            message: "set_model requires provider, model, and baseUrl",
+          });
+          return;
+        }
+        try {
+          router.reconfigure({ provider, model, baseUrl, apiKey: msg.apiKey });
+          transport.send({ type: "model_set", provider, model });
+          log(`model hot-swapped → ${provider}/${model} @ ${baseUrl}`);
+        } catch (err) {
+          transport.send({
+            type: "model_error",
+            message: err instanceof Error ? err.message : String(err),
+          });
+        }
+        break;
+      }
+
       case "message": {
         const id = msg.id ?? crypto.randomUUID();
         const sessionId = msg.sessionId ?? "default";

@@ -8,9 +8,10 @@
  *   - track and persist token usage
  *   - fall back to a secondary model when the primary target fails
  *   - audit every completion (and every budget block)
+ *   - support hot-swap of the active model without restarting (reconfigure)
  *
- * Supported providers: "ollama" (default, local) and any OpenAI-compatible
- * chat-completions endpoint ("openai").
+ * Supported providers: "ollama" (local), "anthropic", and any OpenAI-compatible
+ * chat-completions endpoint ("openai", "deepseek", "openai_compatible", etc.).
  */
 
 import type { Database } from "bun:sqlite";
@@ -22,6 +23,7 @@ import type {
   InferenceRequest,
   InferenceResponse,
   ModelTarget,
+  TokenBudgetConfig,
 } from "../types.ts";
 
 export class BudgetExhaustedError extends Error {
@@ -41,28 +43,30 @@ export class InferenceError extends Error {
 }
 
 export class InferenceRouter {
-  readonly #config: InferenceConfig;
+  // Mutable so reconfigure() can hot-swap the active model at runtime.
+  #primary: ModelTarget;
+  #fallback: ModelTarget | undefined;
+  #trusted: Set<string>;
+
+  readonly #tokenBudget: TokenBudgetConfig;
   readonly #audit: AuditLogger;
   readonly #db: Database;
-  /** Normalized allowlist of base URLs the router is permitted to contact. */
-  readonly #trusted: Set<string>;
   /** In-memory per-conversation token totals (reset when process restarts). */
   readonly #conversationTokens = new Map<string, number>();
 
   constructor(config: InferenceConfig, audit: AuditLogger, db: Database) {
-    this.#config = config;
+    this.#primary = config.primary;
+    this.#fallback = config.fallback;
+    this.#tokenBudget = config.tokenBudget;
     this.#audit = audit;
     this.#db = db;
+    this.#trusted = this.#buildTrusted(
+      config.primary,
+      config.fallback,
+      config.trustedBaseUrls,
+    );
 
-    // The allowlist defaults to exactly the configured targets, so an env-driven
-    // misconfiguration can never silently redirect inference elsewhere. Validate
-    // at construction (fail fast) that every configured target is trusted.
-    const sources =
-      config.trustedBaseUrls && config.trustedBaseUrls.length > 0
-        ? config.trustedBaseUrls
-        : [config.primary.baseUrl, ...(config.fallback ? [config.fallback.baseUrl] : [])];
-    this.#trusted = new Set(sources.map(normalizeBaseUrl));
-
+    // Fail fast at construction if any configured target is not trusted.
     for (const target of [config.primary, config.fallback]) {
       if (target && !this.#trusted.has(normalizeBaseUrl(target.baseUrl))) {
         throw new InferenceError(
@@ -70,6 +74,44 @@ export class InferenceRouter {
         );
       }
     }
+  }
+
+  /**
+   * Hot-swap the active model without restarting the sidecar.
+   *
+   * Called by the transport layer when Rust forwards a `set_model` message.
+   * Rebuilds the trusted URL set to match the new targets, so any previously
+   * trusted endpoint that is no longer configured is no longer reachable.
+   * In-flight completions already in progress are not affected (they snapshot
+   * primary/fallback at call time).
+   */
+  reconfigure(
+    primary: ModelTarget,
+    fallback?: ModelTarget,
+    trustedUrls?: string[],
+  ): void {
+    const newTrusted = this.#buildTrusted(primary, fallback, trustedUrls);
+
+    for (const target of [primary, fallback]) {
+      if (target && !newTrusted.has(normalizeBaseUrl(target.baseUrl))) {
+        throw new InferenceError(
+          `inference target "${target.baseUrl}" is not in trustedBaseUrls`,
+        );
+      }
+    }
+
+    this.#primary = primary;
+    this.#fallback = fallback;
+    this.#trusted = newTrusted;
+  }
+
+  /** Display-safe view of the currently active model (no API keys). */
+  get currentModel(): { provider: string; model: string; baseUrl: string } {
+    return {
+      provider: this.#primary.provider,
+      model: this.#primary.model,
+      baseUrl: this.#primary.baseUrl,
+    };
   }
 
   /** Current per-conversation token total for a session. */
@@ -96,7 +138,9 @@ export class InferenceRouter {
     this.#enforceBudget(req.sessionId);
 
     const start = Date.now();
-    const { primary, fallback } = this.#config;
+    // Snapshot at call time so an in-flight reconfigure() doesn't affect us.
+    const primary = this.#primary;
+    const fallback = this.#fallback;
 
     let response: InferenceResponse;
     try {
@@ -139,8 +183,20 @@ export class InferenceRouter {
     return response;
   }
 
+  #buildTrusted(
+    primary: ModelTarget,
+    fallback: ModelTarget | undefined,
+    trustedBaseUrls: string[] | undefined,
+  ): Set<string> {
+    const sources =
+      trustedBaseUrls && trustedBaseUrls.length > 0
+        ? trustedBaseUrls
+        : [primary.baseUrl, ...(fallback ? [fallback.baseUrl] : [])];
+    return new Set(sources.map(normalizeBaseUrl));
+  }
+
   #enforceBudget(sessionId: string): void {
-    const { perConversation, perDay } = this.#config.tokenBudget;
+    const { perConversation, perDay } = this.#tokenBudget;
 
     if (this.conversationTokens(sessionId) >= perConversation) {
       this.#auditBlocked(sessionId, "conversation token budget exhausted");
@@ -211,7 +267,11 @@ export class InferenceRouter {
     if (target.provider === "ollama") {
       return this.#callOllama(target, req, isFallback);
     }
-    // Treat everything else as an OpenAI-compatible chat endpoint.
+    if (target.provider === "anthropic") {
+      return this.#callAnthropic(target, req, isFallback);
+    }
+    // Treat everything else (openai, deepseek, openai_compatible, …) as an
+    // OpenAI-compatible chat-completions endpoint.
     return this.#callOpenAICompatible(target, req, isFallback);
   }
 
@@ -365,6 +425,10 @@ export class InferenceRouter {
       return this.#streamOpenAI(url, target, req, isFallback);
     }
 
+    const authHeaders: Record<string, string> = target.apiKey
+      ? { Authorization: `Bearer ${target.apiKey}` }
+      : {};
+
     const body = {
       model: target.model,
       messages: req.messages.map(toProviderMessage),
@@ -373,7 +437,7 @@ export class InferenceRouter {
       stream: false,
     };
 
-    const raw = (await this.#postJson(url, body)) as {
+    const raw = (await this.#postJson(url, body, authHeaders)) as {
       choices?: { message?: { content?: string } }[];
       usage?: { prompt_tokens?: number; completion_tokens?: number };
     };
@@ -415,7 +479,10 @@ export class InferenceRouter {
     try {
       const res = await fetch(url, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          ...(target.apiKey ? { Authorization: `Bearer ${target.apiKey}` } : {}),
+        },
         body: JSON.stringify(body),
         signal: controller.signal,
       });
@@ -474,6 +541,155 @@ export class InferenceRouter {
     };
   }
 
+  /** Anthropic Messages API — distinct endpoint and header convention. */
+  async #callAnthropic(
+    target: ModelTarget,
+    req: InferenceRequest,
+    isFallback: boolean,
+  ): Promise<InferenceResponse> {
+    const url = `${trimSlash(target.baseUrl)}/v1/messages`;
+
+    if (req.onToken) {
+      return this.#streamAnthropic(url, target, req, isFallback);
+    }
+
+    const { systemText, userMessages } = splitAnthropicMessages(req.messages);
+    const body: Record<string, unknown> = {
+      model: target.model,
+      max_tokens: req.maxTokens ?? 4096,
+      messages: userMessages,
+      temperature: req.temperature ?? 0.7,
+    };
+    if (systemText) body.system = systemText;
+
+    const authHeaders: Record<string, string> = {
+      "anthropic-version": "2023-06-01",
+    };
+    if (target.apiKey) authHeaders["x-api-key"] = target.apiKey;
+
+    const raw = (await this.#postJson(url, body, authHeaders)) as {
+      content?: { type: string; text: string }[];
+      usage?: { input_tokens?: number; output_tokens?: number };
+    };
+
+    const content = raw.content?.find((b) => b.type === "text")?.text ?? "";
+    const promptTokens =
+      raw.usage?.input_tokens ?? estimateTokens(req.messages);
+    const completionTokens =
+      raw.usage?.output_tokens ?? estimateText(content);
+
+    return {
+      content,
+      promptTokens,
+      completionTokens,
+      totalTokens: promptTokens + completionTokens,
+      model: target.model,
+      usedFallback: isFallback,
+    };
+  }
+
+  async #streamAnthropic(
+    url: string,
+    target: ModelTarget,
+    req: InferenceRequest,
+    isFallback: boolean,
+  ): Promise<InferenceResponse> {
+    const { systemText, userMessages } = splitAnthropicMessages(req.messages);
+    const body: Record<string, unknown> = {
+      model: target.model,
+      max_tokens: req.maxTokens ?? 4096,
+      messages: userMessages,
+      temperature: req.temperature ?? 0.7,
+      stream: true,
+    };
+    if (systemText) body.system = systemText;
+
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      "anthropic-version": "2023-06-01",
+    };
+    if (target.apiKey) headers["x-api-key"] = target.apiKey;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 120_000);
+
+    let content = "";
+    let inputTokens = 0;
+    let outputTokens = 0;
+
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const detail = await res.text().catch(() => "");
+        throw new InferenceError(
+          `inference endpoint ${url} returned ${res.status}: ${detail.slice(0, 200)}`,
+        );
+      }
+      if (!res.body) throw new InferenceError("no response body for streaming");
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+
+      const processSSELine = (line: string): void => {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) return;
+        const data = trimmed.slice(5).trim();
+
+        let chunk: unknown;
+        try { chunk = JSON.parse(data); } catch { return; }
+
+        const type = (chunk as { type?: string }).type;
+
+        if (type === "content_block_delta") {
+          const token =
+            (chunk as { delta?: { type?: string; text?: string } }).delta?.text ?? "";
+          if (token) {
+            content += token;
+            req.onToken!(token);
+          }
+        } else if (type === "message_start") {
+          inputTokens =
+            (chunk as { message?: { usage?: { input_tokens?: number } } })
+              .message?.usage?.input_tokens ?? 0;
+        } else if (type === "message_delta") {
+          outputTokens =
+            (chunk as { usage?: { output_tokens?: number } }).usage
+              ?.output_tokens ?? 0;
+        }
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
+        for (const line of lines) processSSELine(line);
+      }
+      if (buf.trim()) processSSELine(buf);
+    } finally {
+      clearTimeout(timer);
+    }
+
+    const promptTokens = inputTokens || estimateTokens(req.messages);
+    const completionTokens = outputTokens || estimateText(content);
+
+    return {
+      content,
+      promptTokens,
+      completionTokens,
+      totalTokens: promptTokens + completionTokens,
+      model: target.model,
+      usedFallback: isFallback,
+    };
+  }
+
   /**
    * Direct JSON POST. The router is the sanctioned bypass of the egress proxy:
    * local inference must reach localhost, which the proxy blocks by design.
@@ -492,13 +708,17 @@ export class InferenceRouter {
    * deferred to that milestone. For V1 (local inference) this is not exploitable
    * in the intended deployment.
    */
-  async #postJson(url: string, body: unknown): Promise<unknown> {
+  async #postJson(
+    url: string,
+    body: unknown,
+    extraHeaders?: Record<string, string>,
+  ): Promise<unknown> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 120_000);
     try {
       const res = await fetch(url, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", ...extraHeaders },
         body: JSON.stringify(body),
         signal: controller.signal,
       });
@@ -525,6 +745,21 @@ function toProviderMessage(m: ChatMessage): { role: string; content: string } {
   const content =
     m.role === "tool" ? `[tool:${m.name ?? "unknown"}] ${m.content}` : m.content;
   return { role, content };
+}
+
+/**
+ * Anthropic's Messages API separates the system prompt into its own top-level
+ * field. Pull it out before mapping the rest of the conversation.
+ */
+function splitAnthropicMessages(messages: ChatMessage[]): {
+  systemText: string | undefined;
+  userMessages: { role: string; content: string }[];
+} {
+  const systemMsg = messages.find((m) => m.role === "system");
+  const userMessages = messages
+    .filter((m) => m.role !== "system")
+    .map(toProviderMessage);
+  return { systemText: systemMsg?.content, userMessages };
 }
 
 function estimateTokens(messages: ChatMessage[]): number {

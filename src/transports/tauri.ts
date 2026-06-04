@@ -107,5 +107,7 @@ export class TauriTransport implements Transport {
 function isInbound(value: unknown): value is InboundMessage {
   if (typeof value !== "object" || value === null) return false;
   const t = (value as { type?: unknown }).type;
-  return t === "message" || t === "ping" || t === "shutdown";
+  return (
+    t === "message" || t === "ping" || t === "shutdown" || t === "set_model"
+  );
 }

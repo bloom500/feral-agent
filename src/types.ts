@@ -128,6 +128,8 @@ export interface ModelTarget {
   provider: string;
   model: string;
   baseUrl: string;
+  /** API key for cloud providers. Empty/absent for Ollama (local). */
+  apiKey?: string;
 }
 
 export interface TokenBudgetConfig {
@@ -212,10 +214,16 @@ export interface ParsedResponse {
 
 /** Inbound message envelope from any transport. */
 export interface InboundMessage {
-  type: "message" | "ping" | "shutdown";
+  type: "message" | "ping" | "shutdown" | "set_model";
   id?: string;
   content?: string;
   sessionId?: string;
+  // set_model fields (all present when type === "set_model")
+  provider?: string;
+  model?: string;
+  baseUrl?: string;
+  /** API key injected by Rust from the BYOK store — never touches React. */
+  apiKey?: string;
 }
 
 /** Outbound event envelope to any transport. */
@@ -225,6 +233,8 @@ export type OutboundEvent =
   | { type: "tool_start"; tool: string; args: Record<string, unknown> }
   | { type: "tool_done"; tool: string; result: unknown }
   | { type: "proactive"; content: string }
+  | { type: "model_set"; provider: string; model: string }
+  | { type: "model_error"; message: string }
   | { type: "pong" }
   | { type: "error"; id?: string; message: string };
 
